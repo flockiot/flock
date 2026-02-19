@@ -169,7 +169,7 @@ Single static Rust binary. Runs as a systemd service. No Node.js, no Python, no 
 
 Target architectures: `aarch64`, `armv7`, `armv6`, `x86_64` — Linux musl targets.
 
-**Responsibilities:** MQTT connection to the ingester, reconciling actual container state toward desired state, shipping telemetry and logs, managing the local WireGuard interface, self-updating.
+**Responsibilities:** MQTT connection to the ingester, reconciling actual container state toward desired state, shipping telemetry and logs, managing the local WireGuard interface, self-updating, executing host commands on behalf of the platform (OS update orchestration).
 
 **Container runtime abstraction:** Speaks to runtimes via a trait interface. Implementations for containerd (gRPC) and Podman (REST). Configured per device. No Docker daemon required.
 
@@ -178,6 +178,31 @@ Target architectures: `aarch64`, `armv7`, `armv6`, `x86_64` — Linux musl targe
 **Offline resilience:** Backend unreachable means the device keeps running its last known desired state. State reports buffer locally and flush on reconnect.
 
 **Registration:** On first boot reads a provisioning key from config, calls the API, receives credentials and WireGuard configuration, persists locally. Subsequent boots skip this.
+
+### Host OS Update Orchestration
+
+Flock is OS-agnostic — it does not own or build the host OS. Container workloads and the agent binary are managed directly; host OS updates are the operator's responsibility. Flock provides **orchestration** so operators can roll out OS updates safely using the same progressive deployment machinery used for container releases.
+
+**How it works:** A deployment can target a **host command** instead of (or in addition to) a container release. The agent executes a user-provided script or command on the host, reports success or failure back to the platform, and the scheduler applies the same rollout strategies (canary, progressive, manual) and health criteria to decide whether to advance, pause, or rollback.
+
+**What Flock does:**
+- Distributes the command/script to targeted devices via the existing desired-state mechanism
+- Executes it on the host as a controlled action with timeout and exit-code reporting
+- Reports per-device success/failure to the scheduler
+- Applies rollout strategy (canary %, stage gates, health checks) identically to container deployments
+- Supports rollback by executing a separate rollback command if a stage fails
+
+**What Flock does NOT do:**
+- Build or distribute OS images
+- Manage partitions, bootloaders, or A/B root filesystems
+- Know anything about the host OS distribution or package manager
+
+**Example use cases:**
+- `apt-get update && apt-get upgrade -y` rolled out to 5% of devices, wait for health, continue
+- A custom firmware flash script deployed progressively across a fleet
+- A kernel parameter change applied with automatic rollback if devices go offline
+
+This keeps Flock's "any OS" value proposition intact while giving operators production-grade rollout safety for host-level changes.
 
 Implementation details defined in the flock-agent planning session.
 
@@ -275,3 +300,4 @@ To be resolved before the relevant phase.
 - **Rollout health signals (before Phase 5):** Minimum viable signal set for stage gate evaluation. Recommendation: device online rate + OTA confirmation rate as built-ins, with an optional custom ClickHouse query threshold that operators define in the deployment spec.
 - **Delta algorithm (before Phase 7):** bsdiff is the working assumption. Evaluate zstd-based diffing before committing to implementation.
 - **Agent self-update (before Phase 10):** Agent manages its own binary update via a staging path and signals systemd, or a privileged sidecar container manages the agent binary.
+- **Host command schema (before Phase 10):** Define the deployment spec extension for host commands — command string, timeout, expected exit code, rollback command. The scheduler and agent already support the orchestration model; this decision is about the exact API surface.
