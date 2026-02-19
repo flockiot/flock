@@ -1,0 +1,15 @@
+[submodule "flock-api"]
+	path = flock-api
+	url = git@github.com:flockiot/flock-api.git
+[submodule "flock-agent"]
+	path = flock-agent
+	url = git@github.com:flockiot/flock-agent.git
+[submodule "flock-cli"]
+	path = flock-cli
+	url = git@github.com:flockiot/flock-cli.git
+[submodule "flock-ui"]
+	path = flock-ui
+	url = git@github.com:flockiot/flock-ui.git
+[submodule "flock-base"]
+	path = flock-base
+	url = git@github.com:flockiot/flock-base.git
