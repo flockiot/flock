@@ -13,3 +13,6 @@
 [submodule "flock-base"]
 	path = flock-base
 	url = git@github.com:flockiot/flock-base.git
+[submodule "flock-local"]
+	path = flock-local
+	url = git@github.com:flockiot/flock-local.git
