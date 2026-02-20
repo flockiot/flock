@@ -37,18 +37,21 @@ The platform is being built with LLM assistance, guided by a human architect. De
 
 **`flock-local`** — Helm values overrides for local development. Runs the full platform on Docker Desktop Kubernetes (or kind/k3d). Single-binary mode.
 
+**`flock-os`** — OS image recipes built with debos (Debian Bookworm base). Contains recipes for official images, community-contributed recipes, overlay files (flockd config, cloud-init, systemd units), and build scripts. GitHub Actions builds images on tag and uploads to object storage.
+
 **`flock-staging`** — Helm values overrides for staging. No application code.
 
 **`flock-production`** — Helm values overrides for production. No application code.
 
 ### CI/CD
 
-Everything runs through **GitHub Actions**. No ArgoCD, no Flux.
+Everything runs through **GitHub Actions**.
 
 - `flock-api`: test → lint → build Docker image → push to GHCR on tag
 - `flock-agent`: test → cross-compile all target architectures → publish binaries to GitHub Releases on tag
 - `flock-cli`: test → cross-compile all target architectures → publish binaries to GitHub Releases on tag
 - `flock-ui`: test → build static assets → build nginx Docker image → push to GHCR on tag
+- `flock-os`: build debos images for all official targets → upload to object storage on tag
 - `flock-staging` / `flock-production`: on push to main, a workflow authenticates to the target cluster and runs `helm upgrade --install`
 
 ---
@@ -71,9 +74,9 @@ One Go binary. Multiple runtime targets selected at startup via `--target` flag 
 
 **`builder`** — Builds container images when a new release is created. Multi-architecture output (amd64, arm64, armv7). Scales to zero when idle.
 
-**`delta`** — Generates binary delta patches between OCI image layer versions so devices download patches rather than full layers. Scales to zero when idle.
+**`delta`** — Generates binary delta patches between OCI image layer versions and stores them in object storage. Scales to zero when idle.
 
-**`registry-proxy`** — A thin proxy in front of Harbor. When a device pulls an image layer, the proxy checks whether a precomputed delta exists in object storage for that (old digest, new digest) pair. If yes, it serves the patch. If no, it passes through to Harbor transparently.
+**`registry-proxy`** — A thin proxy in front of Harbor. Serves delta manifests that tell the agent which deltas are available for a given image update. Falls through to Harbor transparently for normal pulls.
 
 **`tunnel`** — WireGuard overlay network. Every device gets a WireGuard peer and private IP on registration. Handles SSH proxying for `flock ssh <device>` and reverse tunnels for public device URLs. Horizontal scaling handled at implementation via shared peer state in the KV store.
 
@@ -169,7 +172,9 @@ Single static Rust binary. Runs as a systemd service. No Node.js, no Python, no 
 
 Target architectures: `aarch64`, `armv7`, `armv6`, `x86_64` — Linux musl targets.
 
-**Responsibilities:** MQTT connection to the ingester, reconciling actual container state toward desired state, shipping telemetry and logs, managing the local WireGuard interface, self-updating, executing host commands on behalf of the platform (OS update orchestration).
+**Responsibilities:** MQTT connection to the ingester, reconciling actual container state toward desired state, delta-aware image fetching, shipping telemetry and logs, managing the local WireGuard interface, self-updating, executing host commands on behalf of the platform (OS update orchestration).
+
+**Delta-aware image fetching:** When updating a container, the agent checks whether a precomputed delta exists for the (old digest, new digest) pair. If yes, it fetches the delta from object storage, applies it locally against the cached base layer, and imports the reconstructed layer into the runtime. The device downloads only the diff — real bandwidth saving on constrained networks.
 
 **Container runtime abstraction:** Speaks to runtimes via a trait interface. Implementations for containerd (gRPC) and Podman (REST). Configured per device. No Docker daemon required.
 
@@ -234,6 +239,51 @@ Implementation details defined in the flock-cli planning session.
 
 ---
 
+## FlockOS
+
+The thinnest possible layer on a standard Linux base. Not a custom OS like balenaOS — a minimal, opinionated Debian image that ships exactly what Flock needs and nothing else.
+
+### Why debos, not Yocto
+
+Yocto is too slow to iterate on, has a steep learning curve, and its BitBake DSL is unfriendly to LLM-assisted development. debos uses declarative YAML recipes on top of Debian's package ecosystem — faster builds, easier contributions, standard tooling.
+
+### Base
+
+Debian Bookworm. Read-only root filesystem with A/B partitions for atomic OS updates and automatic fallback.
+
+### Contents
+
+containerd, flock-init, WireGuard, cloud-init. No desktop environment, no package manager on the running system, no SSH server by default (SSH access is through the Flock tunnel).
+
+### A/B Partition Scheme
+
+Two root partitions. The active partition is mounted read-only. Updates write to the inactive partition, update the bootloader to point to it, and reboot. If the new partition fails to boot (no heartbeat within timeout), the bootloader falls back to the previous partition automatically.
+
+### Official Images
+
+- `aarch64-generic` — Raspberry Pi 4/5, generic arm64 SBCs
+- `amd64-generic` — Intel/AMD x86_64 devices
+- `armv7-generic` — Older 32-bit ARM boards
+- `arm64-nvidia` — NVIDIA Jetson (Orin, Xavier) with JetPack runtime libraries
+
+### Community Images
+
+Contributed via PR to the `flock-os` repo. Each community recipe lives in its own directory with a debos YAML recipe and any overlay files. CI builds and publishes images on merge. Community maintainers own their recipes.
+
+---
+
+## Device Provisioning
+
+Three paths for getting devices connected to the platform.
+
+**Dashboard download (zero-friction):** Configure fleet and WiFi credentials in the UI, download a FlockOS image with an embedded provisioning key and cloud-init config. Flash to SD card or eMMC, plug in, device boots and registers automatically.
+
+**CLI configure (existing OS):** `flock configure-device --fleet my-fleet` SSHes into an existing Linux device, installs flock-init and containerd, writes the Flock config, and starts the service. For operators who already have their own OS and just want the agent.
+
+**curl installer (quick start):** `curl -fsSL https://get.flock.io | bash -s -- --fleet-key <key>` for existing Linux devices. Downloads and installs flock-init and containerd, registers the device. Fastest path for experimentation.
+
+---
+
 ## flock-base
 
 Helm chart that deploys the full Flock platform to any Kubernetes cluster with `helm install`.
@@ -290,6 +340,7 @@ Implementation order. Each phase is broken into concrete tasks in a separate pla
 11. **flock-ui** — React dashboard, full workflow, rollout visualization, web terminal.
 12. **CLI** — Rust CLI, core commands: `login`, `push`, `ssh`, `logs`, `devices`, `env`.
 13. **Helm and Deployment** — `flock-base` complete, staging deploys via GitHub Actions, self-hosting guide.
+14. **FlockOS** — debos recipes, A/B update logic, cloud-init integration, first-boot provisioning, official image builds in CI.
 
 ---
 
