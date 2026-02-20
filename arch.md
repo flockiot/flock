@@ -68,9 +68,9 @@ One Go binary. Multiple runtime targets selected at startup via `--target` flag 
 
 **`api`** — User-facing REST API. Authentication, all resource CRUD, SSE for log streaming, WebSocket for the web terminal. What the CLI and UI talk to.
 
-**`ingester`** — Persistent MQTT connections from devices. Every heartbeat, telemetry report, log line, and event flows through here. Writes device state to the KV store, batches telemetry to ClickHouse, publishes structured events to Kafka internal topics. Scales horizontally — any ingester handles any device.
+**`ingester`** — Subscribes to device topics on the MQTT broker. Every heartbeat, telemetry report, log line, and event flows through here. Writes device state to the KV store, batches telemetry to ClickHouse, publishes structured events to internal MQTT topics. Scales horizontally via shared subscriptions — any ingester handles any device.
 
-**`scheduler`** — Rollout execution engine. Consumes Kafka events, evaluates active rollouts, advances or pauses them based on policy and health signals, pushes desired state to devices. Single replica with leader election.
+**`scheduler`** — Rollout execution engine. Subscribes to internal MQTT topics, evaluates active rollouts, advances or pauses them based on policy and health signals, publishes desired state to device topics on the broker. Single replica with leader election.
 
 **`builder`** — Builds container images when a new release is created. Multi-architecture output (amd64, arm64, armv7). Scales to zero when idle.
 
@@ -82,7 +82,7 @@ One Go binary. Multiple runtime targets selected at startup via `--target` flag 
 
 **`proxy`** — Public device URL feature. Routes `<uuid>.devices.flock.io` HTTP/HTTPS to the correct device port through the tunnel layer. Wildcard DNS, dynamic routing, no static config per device.
 
-**`events-gateway`** — Customer-facing event streaming. Consumes versioned customer-facing Kafka topics and fans them out to webhook endpoints, WebSocket connections, and customer Kafka topics.
+**`events-gateway`** — Customer-facing event streaming. Subscribes to customer-facing MQTT topics and fans them out to webhook endpoints and WebSocket connections.
 
 ### Data Layer
 
@@ -90,7 +90,7 @@ Each concern has a different access pattern and lives in a different store. Spec
 
 **PostgreSQL** — Relational, slowly-changing, strongly consistent data. Organizations, users, memberships, fleets, devices (registration metadata only), releases, deployments, rollout state, provisioning keys, API keys, environment variables, event subscriptions, build jobs.
 
-**Pluggable KV store** — Live device state only: reported state (what the device is running now, written by ingester on every heartbeat) and desired state (what the scheduler wants it to run). Interface-based in Go with implementations for Redis/Valkey, ScyllaDB, and DynamoDB — selected via config. The interface is defined from day one. Redis/Valkey is the only required implementation for v1; the others follow when there is a concrete scale requirement.
+**Pluggable KV store** — Live device state only: reported state (what the device is running now, written by ingester on every heartbeat) and desired state (what the scheduler wants it to run). Interface-based in Go with implementations for Valkey, ScyllaDB, and DynamoDB — selected via config. The interface is defined from day one. Valkey is the only required implementation for v1; the others follow when there is a concrete scale requirement.
 
 **ClickHouse** — All time-series data from devices: connectivity events, OTA progress, system telemetry (CPU, memory, disk, network, temperature), container logs. Append-only, high write throughput, batched writes from the ingester.
 
@@ -100,17 +100,17 @@ Each concern has a different access pattern and lives in a different store. Spec
 
 **S3-compatible object storage** — Delta patch files, build logs, OS image artifacts. MinIO locally, any S3-compatible store in production. Configured via endpoint URL, not vendor-specific.
 
-**Kafka** — Internal message bus and foundation for the customer event system. All async communication between backend targets flows through Kafka. Self-hosted via Bitnami Helm chart. Schema enforcement via Apicurio Schema Registry.
+**MQTT broker** — Central message bus for all async communication: device-to-cloud, cloud-to-device, and internal service-to-service. Self-hosted EMQX (or compatible broker) as a Helm subchart. All backend targets are MQTT clients — no target accepts device connections directly.
 
-**Apicurio Schema Registry** — Validates Kafka message schemas at publish time. Fully open source, no Confluent dependency. Prevents schema drift between internal services and enforces the stability contract on customer-facing topics.
+### MQTT Topic Conventions
 
-### Kafka Topic Conventions
+A deliberate namespace boundary enforces the difference between device topics, internal topics, and customer-facing topics.
 
-A deliberate namespace boundary enforces the difference between internal and external contracts.
+**`devices/{id}/+`** — Per-device topics. Devices publish to `devices/{id}/state`, `devices/{id}/telemetry`, `devices/{id}/logs`. Backend publishes to `devices/{id}/desired`, `devices/{id}/commands`.
 
-**`flock.internal.v1.*`** — Internal topics. Consumed only by Flock backend services. Schema can evolve with a version bump and coordinated deployment. Examples: `flock.internal.v1.device.state`, `flock.internal.v1.build.status`.
+**`flock/internal/v1/+`** — Internal topics. Consumed only by Flock backend services. Schema can evolve with a version bump and coordinated deployment. Examples: `flock/internal/v1/device/state`, `flock/internal/v1/build/status`.
 
-**`flock.events.v1.*`** — Customer-facing topics. Stable, versioned, treated as a public API. The events gateway translates from internal topics to these — internal changes never break customer integrations. Bumping to v2 means running both versions in parallel until customers migrate. Examples: `flock.events.v1.device.online`, `flock.events.v1.rollout.completed`.
+**`flock/events/v1/+`** — Customer-facing topics. Stable, versioned, treated as a public API. The events gateway translates from internal topics to these — internal changes never break customer integrations. Bumping to v2 means running both versions in parallel until customers migrate. Examples: `flock/events/v1/device/online`, `flock/events/v1/rollout/completed`.
 
 ### Authentication
 
@@ -124,7 +124,7 @@ Authorization uses RBAC: `owner`, `admin`, `developer`, `viewer` per organizatio
 
 ### Device Communication
 
-**MQTT over TLS** between devices and the ingester. The ingester embeds an MQTT broker — no external broker required. Devices publish state, telemetry, logs, and events. Devices subscribe to desired state and command topics. The ingester translates between MQTT and Kafka internal topics.
+**MQTT over TLS** between devices and the broker. Devices publish state, telemetry, logs, and events. Devices subscribe to desired state and command topics. Backend targets subscribe to device topics via shared subscription groups for horizontal scaling.
 
 Synchronous internal communication between targets (tunnel management, build log streaming) uses **gRPC**.
 
@@ -147,18 +147,17 @@ Creating a deployment does not immediately change anything on any device. It cre
 
 ### Audit Logging
 
-Every mutating action produces a structured audit event. Audit events are published to a dedicated Kafka internal topic and consumed by a writer that ships them to Loki as structured log streams labeled by org, actor, action type, and resource.
+Every mutating action produces a structured audit event. Audit events are published to a dedicated internal MQTT topic and consumed by a writer that ships them to Loki as structured log streams labeled by org, actor, action type, and resource.
 
 Operators can configure Loki retention per label selector and route audit streams to external SIEM systems via standard Loki output mechanisms.
 
 ### Customer Event Streaming
 
-The `events-gateway` target consumes `flock.events.v1.*` Kafka topics and delivers to customer-configured subscriptions.
+The `events-gateway` target subscribes to `flock/events/v1/+` MQTT topics and delivers to customer-configured subscriptions.
 
 **Delivery mechanisms:**
 - **Webhooks** — POST JSON to a customer HTTPS endpoint. HMAC signature verification. Automatic retry with exponential backoff. Delivery log queryable via API.
 - **WebSocket** — Authenticated persistent connection. Events delivered in real time. Useful for customer dashboards and internal tooling.
-- **Kafka forwarding** — For self-hosted customers with their own Kafka, events forwarded to a customer-specified topic.
 
 Subscriptions are stored in PostgreSQL and filter by event type, fleet, or device. Customers receive only what they subscribed to.
 
@@ -172,7 +171,7 @@ Single static Rust binary. Runs as a systemd service. No Node.js, no Python, no 
 
 Target architectures: `aarch64`, `armv7`, `armv6`, `x86_64` — Linux musl targets.
 
-**Responsibilities:** MQTT connection to the ingester, reconciling actual container state toward desired state, delta-aware image fetching, shipping telemetry and logs, managing the local WireGuard interface, self-updating, executing host commands on behalf of the platform (OS update orchestration).
+**Responsibilities:** MQTT connection to the broker, reconciling actual container state toward desired state, delta-aware image fetching, shipping telemetry and logs, managing the local WireGuard interface, self-updating, executing host commands on behalf of the platform (OS update orchestration).
 
 **Delta-aware image fetching:** When updating a container, the agent checks whether a precomputed delta exists for the (old digest, new digest) pair. If yes, it fetches the delta from object storage, applies it locally against the cached base layer, and imports the reconstructed layer into the runtime. The device downloads only the diff — real bandwidth saving on constrained networks.
 
@@ -288,13 +287,13 @@ Three paths for getting devices connected to the platform.
 
 Helm chart that deploys the full Flock platform to any Kubernetes cluster with `helm install`.
 
-**Infrastructure subcharts** (each disableable to use external managed services): PostgreSQL, Kafka (Bitnami), Apicurio Schema Registry, Redis/Valkey, ClickHouse, Loki, Harbor, MinIO, Zitadel.
+**Infrastructure subcharts** (each disableable to use external managed services): PostgreSQL, EMQX, Valkey, ClickHouse, Loki, Harbor, MinIO, Zitadel.
 
 **Deployment modes:**
 - *Single-binary* (`singleBinary: true`): all targets in one Deployment. For staging and small self-hosted.
 - *Distributed*: each target its own Deployment with independent HPA. For production.
 
-`builder` and `delta` use KEDA for scale-to-zero based on Kafka consumer lag. `tunnel` and `ingester` each require a LoadBalancer service for external traffic.
+`builder` and `delta` scale to zero when idle. `tunnel` requires a LoadBalancer service for external traffic. EMQX requires a LoadBalancer service for device MQTT connections.
 
 ---
 
@@ -308,11 +307,10 @@ Staging uses single-binary mode. Production uses distributed mode.
 
 ## Free Deployment (Development Phase)
 
-**Backend:** Fly.io. Single Machine running `--target=all`. Fly Managed Postgres. Zitadel on a second Fly Machine.
+**Backend:** Fly.io. Single Machine running `--target=all`. Fly Managed Postgres. Zitadel on a second Fly Machine. EMQX on a third Fly Machine.
 
 **External free tiers:**
-- Upstash Kafka for the message bus (note: ~10k messages/day cap suits small dev device counts)
-- Upstash Redis for KV state
+- Upstash Valkey for KV state
 - ClickHouse Cloud for telemetry
 - Cloudflare R2 for object storage
 - Grafana Cloud for Loki (audit + device logs)
@@ -330,7 +328,7 @@ Implementation order. Each phase is broken into concrete tasks in a separate pla
 1. **Foundation** — `flock-api` repo, multi-target binary, config, infrastructure connections, docker-compose, health check.
 2. **Identity and Auth** — PostgreSQL schema, Zitadel, JWT validation, RBAC, provisioning keys, audit event publishing.
 3. **Core API** — All REST handlers. OpenAPI spec committed.
-4. **Device Connectivity** — Ingester, MQTT broker, live device state, Kafka publishing.
+4. **Device Connectivity** — MQTT broker, ingester, live device state, internal event publishing.
 5. **Rollout Engine** — Scheduler, deployment execution, all strategies, health criteria, auto-rollback.
 6. **Build Pipeline** — Builder, multi-arch builds, log streaming.
 7. **Registry and Deltas** — Harbor subchart, registry-proxy, delta generation and serving.
